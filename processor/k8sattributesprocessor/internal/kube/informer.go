@@ -21,14 +21,14 @@ import (
 
 const kubeSystemNamespace = "kube-system"
 
-// InformerProvider defines a function type that returns a new SharedInformer. It is used to
+// InformerProvider defines a function type that returns a new SharedIndexInformer. It is used to
 // allow passing custom shared informers to the watch client.
 type InformerProvider func(
 	client kubernetes.Interface,
 	namespace string,
 	labelSelector labels.Selector,
 	fieldSelector fields.Selector,
-) cache.SharedInformer
+) cache.SharedIndexInformer
 
 // InformerProviderNamespace defines a function type that returns a new SharedInformer. It is used to
 // allow passing custom shared informers to the watch client for fetching namespace objects.
@@ -50,14 +50,15 @@ func newSharedInformer(
 	ls labels.Selector,
 	fs fields.Selector,
 	watchSyncPeriod time.Duration,
-) cache.SharedInformer {
-	informer := cache.NewSharedInformer(
+) cache.SharedIndexInformer {
+	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListWithContextFunc:  informerListFuncWithSelectors(client, namespace, ls, fs),
 			WatchFuncWithContext: informerWatchFuncWithSelectors(client, namespace, ls, fs),
 		},
 		&api_v1.Pod{},
 		watchSyncPeriod,
+		cache.Indexers{},
 	)
 	return informer
 }

@@ -57,48 +57,45 @@ func newPodIdentifier(from, name, value string) PodIdentifier {
 	}
 }
 
+func assertPodExists(t *testing.T, c *WatchClient, id PodIdentifier, expectedIP string, expectedName string, expectedUID string) {
+	got, ok := c.GetPod(id)
+	assert.True(t, ok)
+	assert.NotNil(t, got)
+	assert.Equal(t, expectedIP, got.Address)
+	assert.Equal(t, expectedName, got.Name)
+	assert.Equal(t, expectedUID, got.PodUID)
+}
+
 func podAddAndUpdateTest(t *testing.T, c *WatchClient, handler func(obj any)) {
-	assert.Empty(t, c.Pods)
+	assert.Empty(t, c.informer.GetStore().List())
 
 	// pod without IP
 	pod := &api_v1.Pod{}
 	handler(pod)
-	assert.Empty(t, c.Pods)
+	assert.Empty(t, c.informer.GetStore().List())
 
 	pod = &api_v1.Pod{}
 	pod.Name = "podA"
 	pod.Status.PodIP = "1.1.1.1"
 	handler(pod)
-	assert.Len(t, c.Pods, 2)
-	got := c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1")]
-	assert.Equal(t, "1.1.1.1", got.Address)
-	assert.Equal(t, "podA", got.Name)
-	assert.Empty(t, got.PodUID)
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), "1.1.1.1", "podA", "")
 
 	pod = &api_v1.Pod{}
 	pod.Name = "podB"
 	pod.Status.PodIP = "1.1.1.1"
 	handler(pod)
-	assert.Len(t, c.Pods, 2)
-	got = c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1")]
-	assert.Equal(t, "1.1.1.1", got.Address)
-	assert.Equal(t, "podB", got.Name)
-	assert.Empty(t, got.PodUID)
+	assert.Len(t, c.informer.GetStore().List(), 2)
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), "1.1.1.1", "podB", "")
 
 	pod = &api_v1.Pod{}
 	pod.Name = "podC"
 	pod.Status.PodIP = "2.2.2.2"
 	pod.UID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	handler(pod)
-	assert.Len(t, c.Pods, 5)
-	got = c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "2.2.2.2")]
-	assert.Equal(t, "2.2.2.2", got.Address)
-	assert.Equal(t, "podC", got.Name)
-	assert.Equal(t, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", got.PodUID)
-	got = c.Pods[newPodIdentifier("resource_attribute", "k8s.pod.uid", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")]
-	assert.Equal(t, "2.2.2.2", got.Address)
-	assert.Equal(t, "podC", got.Name)
-	assert.Equal(t, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", got.PodUID)
+	assert.Len(t, c.informer.GetStore().List(), 3)
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "2.2.2.2"), "2.2.2.2", "podC", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	assertPodExists(t, c, newPodIdentifier("resource_attribute", "k8s.pod.uid", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"), "2.2.2.2", "podC", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 }
 
 func namespaceAddAndUpdateTest(t *testing.T, c *WatchClient, handler func(obj any)) {
@@ -300,7 +297,7 @@ func TestReplicaSetHandler(t *testing.T) {
 
 func TestPodHostNetwork(t *testing.T) {
 	c, _ := newTestClient(t)
-	assert.Empty(t, c.Pods)
+	assert.Empty(t, c.informer.GetStore().List())
 
 	// pod will not be added if no rule matches
 	pod := &api_v1.Pod{}
@@ -308,7 +305,7 @@ func TestPodHostNetwork(t *testing.T) {
 	pod.Status.PodIP = "1.1.1.1"
 	pod.Spec.HostNetwork = true
 	c.handlePodAdd(pod)
-	assert.Empty(t, c.Pods)
+	assert.Empty(t, c.informer.GetStore().List())
 
 	// pod will be added if rule matches
 	pod.Name = "podB"
@@ -316,59 +313,48 @@ func TestPodHostNetwork(t *testing.T) {
 	pod.UID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	pod.Spec.HostNetwork = true
 	c.handlePodAdd(pod)
-	assert.Len(t, c.Pods, 1)
-	got := c.Pods[newPodIdentifier("resource_attribute", "k8s.pod.uid", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")]
-	assert.Equal(t, "2.2.2.2", got.Address)
-	assert.Equal(t, "podB", got.Name)
-	assert.Equal(t, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", got.PodUID)
-	assert.False(t, got.Ignore)
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	assertPodExists(t, c, newPodIdentifier("resource_attribute", "k8s.pod.uid", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"), "2.2.2.2", "podB", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 }
 
 // TestPodCreate tests that a new pod, created after otel-collector starts, has its attributes set
 // correctly
+func assertPodExistsWithNoIP(t *testing.T, c *WatchClient, id PodIdentifier, expectedName string, expectedUID string) {
+	got, ok := c.GetPod(id)
+	assert.True(t, ok)
+	assert.NotNil(t, got)
+	assert.Empty(t, got.Address)
+	assert.Equal(t, expectedName, got.Name)
+	assert.Equal(t, expectedUID, got.PodUID)
+}
+
 func TestPodCreate(t *testing.T) {
 	c, _ := newTestClient(t)
-	assert.Empty(t, c.Pods)
+	assert.Empty(t, c.informer.GetStore().List())
 
 	// pod is created in Pending phase. At this point it has a UID but no start time or pod IP address
 	pod := &api_v1.Pod{}
 	pod.Name = "podD"
 	pod.UID = "11111111-2222-3333-4444-555555555555"
 	c.handlePodAdd(pod)
-	assert.Len(t, c.Pods, 1)
-	got := c.Pods[newPodIdentifier("resource_attribute", "k8s.pod.uid", "11111111-2222-3333-4444-555555555555")]
-	assert.Empty(t, got.Address)
-	assert.Equal(t, "podD", got.Name)
-	assert.Equal(t, "11111111-2222-3333-4444-555555555555", got.PodUID)
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	assertPodExistsWithNoIP(t, c, newPodIdentifier("resource_attribute", "k8s.pod.uid", "11111111-2222-3333-4444-555555555555"), "podD", "11111111-2222-3333-4444-555555555555")
 
 	// pod is scheduled onto to a node (no changes relevant to this test happen in that event)
 	// pod is started, and given a startTime but not an IP address - it's still Pending at this point
 	startTime := meta_v1.NewTime(time.Now())
 	pod.Status.StartTime = &startTime
 	c.handlePodUpdate(&api_v1.Pod{}, pod)
-	assert.Len(t, c.Pods, 1)
-	got = c.Pods[newPodIdentifier("resource_attribute", "k8s.pod.uid", "11111111-2222-3333-4444-555555555555")]
-	assert.Empty(t, got.Address)
-	assert.Equal(t, "podD", got.Name)
-	assert.Equal(t, "11111111-2222-3333-4444-555555555555", got.PodUID)
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	assertPodExistsWithNoIP(t, c, newPodIdentifier("resource_attribute", "k8s.pod.uid", "11111111-2222-3333-4444-555555555555"), "podD", "11111111-2222-3333-4444-555555555555")
 
 	// pod is Running and has an IP address
 	pod.Status.PodIP = "3.3.3.3"
 	c.handlePodUpdate(&api_v1.Pod{}, pod)
-	assert.Len(t, c.Pods, 3)
-	got = c.Pods[newPodIdentifier("resource_attribute", "k8s.pod.uid", "11111111-2222-3333-4444-555555555555")]
-	assert.Equal(t, "3.3.3.3", got.Address)
-	assert.Equal(t, "podD", got.Name)
-	assert.Equal(t, "11111111-2222-3333-4444-555555555555", got.PodUID)
-	got = c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "3.3.3.3")]
-	assert.Equal(t, "3.3.3.3", got.Address)
-	assert.Equal(t, "podD", got.Name)
-	assert.Equal(t, "11111111-2222-3333-4444-555555555555", got.PodUID)
-
-	got = c.Pods[newPodIdentifier("resource_attribute", "k8s.pod.ip", "3.3.3.3")]
-	assert.Equal(t, "3.3.3.3", got.Address)
-	assert.Equal(t, "podD", got.Name)
-	assert.Equal(t, "11111111-2222-3333-4444-555555555555", got.PodUID)
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	assertPodExists(t, c, newPodIdentifier("resource_attribute", "k8s.pod.uid", "11111111-2222-3333-4444-555555555555"), "3.3.3.3", "podD", "11111111-2222-3333-4444-555555555555")
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "3.3.3.3"), "3.3.3.3", "podD", "11111111-2222-3333-4444-555555555555")
+	assertPodExists(t, c, newPodIdentifier("resource_attribute", "k8s.pod.ip", "3.3.3.3"), "3.3.3.3", "podD", "11111111-2222-3333-4444-555555555555")
 }
 
 func TestPodAddOutOfSync(t *testing.T) {
@@ -381,7 +367,7 @@ func TestPodAddOutOfSync(t *testing.T) {
 			},
 		},
 	})
-	assert.Empty(t, c.Pods)
+	assert.Empty(t, c.informer.GetStore().List())
 
 	pod := &api_v1.Pod{}
 	pod.Name = "podA"
@@ -389,13 +375,9 @@ func TestPodAddOutOfSync(t *testing.T) {
 	startTime := meta_v1.NewTime(time.Now())
 	pod.Status.StartTime = &startTime
 	c.handlePodAdd(pod)
-	assert.Len(t, c.Pods, 3)
-	got := c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1")]
-	assert.Equal(t, "1.1.1.1", got.Address)
-	assert.Equal(t, "podA", got.Name)
-	got = c.Pods[newPodIdentifier(ResourceSource, "k8s.pod.name", "podA")]
-	assert.Equal(t, "1.1.1.1", got.Address)
-	assert.Equal(t, "podA", got.Name)
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), "1.1.1.1", "podA", "")
+	assertPodExists(t, c, newPodIdentifier(ResourceSource, "k8s.pod.name", "podA"), "1.1.1.1", "podA", "")
 
 	pod2 := &api_v1.Pod{}
 	pod2.Name = "podB"
@@ -403,13 +385,11 @@ func TestPodAddOutOfSync(t *testing.T) {
 	startTime2 := meta_v1.NewTime(time.Now().Add(-time.Second * 10))
 	pod2.Status.StartTime = &startTime2
 	c.handlePodAdd(pod2)
-	assert.Len(t, c.Pods, 4)
-	got = c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1")]
-	assert.Equal(t, "1.1.1.1", got.Address)
-	assert.Equal(t, "podA", got.Name)
-	got = c.Pods[newPodIdentifier(ResourceSource, "k8s.pod.name", "podB")]
-	assert.Equal(t, "1.1.1.1", got.Address)
-	assert.Equal(t, "podB", got.Name)
+	assert.Len(t, c.informer.GetStore().List(), 2)
+	// should still get podA (newer) for connection IP address
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), "1.1.1.1", "podA", "")
+	// but can get podB for its name
+	assertPodExists(t, c, newPodIdentifier(ResourceSource, "k8s.pod.name", "podB"), "1.1.1.1", "podB", "")
 }
 
 func TestPodUpdate(t *testing.T) {
@@ -439,8 +419,8 @@ func TestNodeUpdate(t *testing.T) {
 func TestPodDelete(t *testing.T) {
 	c, _ := newTestClient(t)
 	podAddAndUpdateTest(t, c, c.handlePodAdd)
-	assert.Len(t, c.Pods, 5)
-	assert.Equal(t, "1.1.1.1", c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1")].Address)
+	assert.Len(t, c.informer.GetStore().List(), 3)
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), "1.1.1.1", "podB", "")
 
 	// delete empty IP pod
 	c.handlePodDelete(&api_v1.Pod{})
@@ -450,9 +430,8 @@ func TestPodDelete(t *testing.T) {
 	pod := &api_v1.Pod{}
 	pod.Status.PodIP = "9.9.9.9"
 	c.handlePodDelete(pod)
-	assert.Len(t, c.Pods, 5)
-	got := c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1")]
-	assert.Equal(t, "1.1.1.1", got.Address)
+	assert.Len(t, c.informer.GetStore().List(), 3)
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), "1.1.1.1", "podB", "")
 	assert.Empty(t, c.deleteQueue)
 
 	// delete matching IP with wrong name/different pod
@@ -461,9 +440,8 @@ func TestPodDelete(t *testing.T) {
 	pod.Status.PodIP = "1.1.1.1"
 	pod.UID = "aaaaaaaa-bbbb-cccc-dddd"
 	c.handlePodDelete(pod)
-	got = c.Pods[newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1")]
-	assert.Len(t, c.Pods, 5)
-	assert.Equal(t, "1.1.1.1", got.Address)
+	assert.Len(t, c.informer.GetStore().List(), 3)
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), "1.1.1.1", "podB", "")
 	assert.Empty(t, c.deleteQueue)
 
 	// delete matching IP and name
@@ -473,7 +451,10 @@ func TestPodDelete(t *testing.T) {
 	pod.Status.PodIP = "1.1.1.1"
 	tsBeforeDelete := time.Now()
 	c.handlePodDelete(pod)
-	assert.Len(t, c.Pods, 5)
+	// store should now have 2 pods (podA and podC)
+	assert.Len(t, c.informer.GetStore().List(), 2)
+	// since podA is still active in the store, GetPod should return podA
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), "1.1.1.1", "podA", "")
 	assert.Len(t, c.deleteQueue, 3)
 	deleteRequest := c.deleteQueue[0]
 	assert.Equal(t, newPodIdentifier("connection", "k8s.pod.ip", "1.1.1.1"), deleteRequest.id)
@@ -488,7 +469,10 @@ func TestPodDelete(t *testing.T) {
 	pod.UID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	tsBeforeDelete = time.Now()
 	c.handlePodDelete(cache.DeletedFinalStateUnknown{Obj: pod})
-	assert.Len(t, c.Pods, 5)
+	// store should now have 1 pod (podA)
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	// podC should still be retrievable from deletedPods map
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "2.2.2.2"), "2.2.2.2", "podC", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 	assert.Len(t, c.deleteQueue, 5)
 	deleteRequest = c.deleteQueue[0]
 	assert.Equal(t, newPodIdentifier("connection", "k8s.pod.ip", "2.2.2.2"), deleteRequest.id)
@@ -573,17 +557,17 @@ func TestNodeDelete(t *testing.T) {
 }
 
 func TestDeleteLoop(t *testing.T) {
-	// go c.deleteLoop(time.Second * 1)
 	c, _ := newTestClient(t)
 
 	pod := &api_v1.Pod{}
 	pod.Status.PodIP = "1.1.1.1"
 	c.handlePodAdd(pod)
-	assert.Len(t, c.Pods, 2)
+	assert.Len(t, c.informer.GetStore().List(), 1)
 	assert.Empty(t, c.deleteQueue)
 
 	c.handlePodDelete(pod)
-	assert.Len(t, c.Pods, 2)
+	assert.Len(t, c.informer.GetStore().List(), 0)
+	assert.Len(t, c.deletedPods, 2)
 	assert.Len(t, c.deleteQueue, 3)
 
 	gracePeriod := time.Millisecond * 500
@@ -591,7 +575,7 @@ func TestDeleteLoop(t *testing.T) {
 	go func() {
 		time.Sleep(time.Millisecond * 50)
 		c.m.Lock()
-		assert.Len(t, c.Pods, 2)
+		assert.Len(t, c.deletedPods, 2)
 		c.m.Unlock()
 		c.deleteMut.Lock()
 		assert.Len(t, c.deleteQueue, 3)
@@ -599,7 +583,7 @@ func TestDeleteLoop(t *testing.T) {
 
 		time.Sleep(gracePeriod + (time.Millisecond * 50))
 		c.m.Lock()
-		assert.Empty(t, c.Pods)
+		assert.Empty(t, c.deletedPods)
 		c.m.Unlock()
 		c.deleteMut.Lock()
 		assert.Empty(t, c.deleteQueue)
@@ -614,8 +598,13 @@ func TestGetIgnoredPod(t *testing.T) {
 	pod := &api_v1.Pod{}
 	pod.Status.PodIP = "1.1.1.1"
 	c.handlePodAdd(pod)
-	c.Pods[newPodIdentifier("connection", "k8s.pod.ip", pod.Status.PodIP)].Ignore = true
-	got, ok := c.GetPod(newPodIdentifier("connection", "k8s.pod.ip", pod.Status.PodIP))
+
+	id := newPodIdentifier("connection", "k8s.pod.ip", pod.Status.PodIP)
+	gotPod, ok := c.GetPod(id)
+	assert.True(t, ok)
+	gotPod.Ignore = true
+
+	got, ok := c.GetPod(id)
 	assert.Nil(t, got)
 	assert.False(t, ok)
 }
@@ -628,7 +617,7 @@ func TestHandlerWrongType(t *testing.T) {
 	c.handlePodUpdate(1, 2)
 	assert.Equal(t, 3, logs.Len())
 	for _, l := range logs.All() {
-		assert.Equal(t, "object received was not of type api_v1.Pod", l.Message)
+		assert.Equal(t, "object received was not of type *Pod or *api_v1.Pod", l.Message)
 	}
 }
 
@@ -1575,7 +1564,7 @@ func TestDeleteQueue(t *testing.T) {
 	doAssertions := func(pod *api_v1.Pod) {
 		podIdentifiers := makePodIdentifiers(pod)
 		for _, id := range podIdentifiers {
-			foundPod, ok := c.Pods[id]
+			foundPod, ok := c.GetPod(id)
 			assert.True(t, ok, "Pod should be present in c.Pods for identifier %v", id)
 			assert.Equal(t, pod.UID, types.UID(foundPod.PodUID))
 			assert.Equal(t, "ns", foundPod.Namespace)
@@ -1584,8 +1573,8 @@ func TestDeleteQueue(t *testing.T) {
 		}
 	}
 
-	// Clear the pods map to start fresh...
-	c.Pods = make(map[PodIdentifier]*Pod)
+	// Clear the deleted pods map to start fresh...
+	c.deletedPods = make(map[PodIdentifier]*Pod)
 	// Set associations to match what we have configured for our OpenTelemetry Collector.
 	c.Associations = []Association{
 		{
@@ -1629,31 +1618,41 @@ func TestDeleteQueue(t *testing.T) {
 	pod1 := makePod("12345678-1234-1234-1234-123456789abc")
 	c.handlePodAdd(pod1)
 	doAssertions(pod1)
-	assert.Len(t, c.Pods, 4)
+	assert.Len(t, c.informer.GetStore().List(), 1)
 
-	// Delete a pod and verify that we can still found it by all identifiers
+	// Delete a pod and verify that we can still find it by all identifiers
 	c.handlePodDelete(pod1)
 	doAssertions(pod1)
-	assert.Len(t, c.Pods, 4)
+	assert.Len(t, c.informer.GetStore().List(), 0)
+	assert.Len(t, c.deletedPods, 4)
 
 	// Add a pod with the same values as pod1 except for UID, and verify that we can find it by all identifiers.
 	pod2 := makePod("87654321-4321-4321-4321-cba987654321")
 	c.handlePodAdd(pod2)
 	doAssertions(pod2)
-	assert.Len(t, c.Pods, 5) // 4 from pod2 + 1 from pod1 (the pod UID identifier)
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	assert.Len(t, c.deletedPods, 4)
+
+	uidId := newPodIdentifier("resource_attribute", "k8s.pod.uid", "12345678-1234-1234-1234-123456789abc")
+	gotPod, ok := c.GetPod(uidId)
+	assert.True(t, ok)
+	assert.Equal(t, "12345678-1234-1234-1234-123456789abc", gotPod.PodUID)
 
 	c.deleteLoopProcessing(0 * time.Second)
-	assert.Len(t, c.Pods, 4) // Only mappings for pod2 remain
+	assert.Len(t, c.informer.GetStore().List(), 1)
+	assert.Empty(t, c.deletedPods)
 	doAssertions(pod2)
 
 	// Delete pod2 and verify that it gets removed after the next delete loop housekeeping.
 	c.handlePodDelete(pod2)
-	assert.Len(t, c.Pods, 4) // Only mappings for pod2 remain
+	assert.Len(t, c.informer.GetStore().List(), 0)
+	assert.Len(t, c.deletedPods, 4)
 	doAssertions(pod2)
 
 	// Delete loop processing should remove mappings for pod2.
 	c.deleteLoopProcessing(0 * time.Second)
-	assert.Empty(t, c.Pods) // No more mappings
+	assert.Empty(t, c.informer.GetStore().List())
+	assert.Empty(t, c.deletedPods)
 }
 
 func TestNodeExtractionRules(t *testing.T) {
@@ -3655,7 +3654,7 @@ func newTestClient(t *testing.T) (*WatchClient, *observer.ObservedLogs) {
 }
 
 type neverSyncedFakeClient struct {
-	cache.SharedInformer
+	cache.SharedIndexInformer
 }
 
 type neverSyncedResourceEventHandlerRegistration struct {
@@ -3667,7 +3666,7 @@ func (*neverSyncedResourceEventHandlerRegistration) HasSynced() bool {
 }
 
 func (n *neverSyncedFakeClient) AddEventHandler(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
-	delegate, err := n.SharedInformer.AddEventHandler(handler)
+	delegate, err := n.SharedIndexInformer.AddEventHandler(handler)
 	if err != nil {
 		return nil, err
 	}
@@ -3685,7 +3684,7 @@ func TestWaitForMetadata(t *testing.T) {
 		err:              false,
 	}, {
 		name: "wait but never synced",
-		informerProvider: func(client kubernetes.Interface, namespace string, labelSelector labels.Selector, fieldSelector fields.Selector) cache.SharedInformer {
+		informerProvider: func(client kubernetes.Interface, namespace string, labelSelector labels.Selector, fieldSelector fields.Selector) cache.SharedIndexInformer {
 			return &neverSyncedFakeClient{NewFakeInformer(client, namespace, labelSelector, fieldSelector)}
 		},
 		err: true,
@@ -4747,28 +4746,7 @@ func TestMetadataNewForConfigFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "metadata.NewForConfig failed")
 }
 
-func TestCompactPodMap(t *testing.T) {
-	podA := PodIdentifier{{Value: "pod-a"}}
-	podB := PodIdentifier{{Value: "pod-b"}}
-	podC := PodIdentifier{{Value: "pod-c"}}
 
-	c := WatchClient{
-		Pods: map[PodIdentifier]*Pod{
-			podA: {},
-			podB: {},
-		},
-	}
-
-	c.Pods[podC] = &Pod{}
-	delete(c.Pods, podA)
-
-	c.compactPodMap()
-
-	assert.Contains(t, c.Pods, podB)
-	assert.Contains(t, c.Pods, podC)
-	assert.NotContains(t, c.Pods, podA)
-	assert.Len(t, c.Pods, 2)
-}
 
 // TestExtractPodAttributesClusterUIDRace is a regression test for issue 47910
 // There used to be a data race where extractPodAttributes read c.Namespaces
@@ -4829,10 +4807,10 @@ func TestPodDeleteIPMissingFromDeleteEvent(t *testing.T) {
 	pod.UID = "uid-leak-test"
 	c.handlePodAdd(pod)
 
-	// Map should have 3 keys for this pod
-	assert.Contains(t, c.Pods, newPodIdentifier("resource_attribute", "k8s.pod.uid", "uid-leak-test"))
-	assert.Contains(t, c.Pods, newPodIdentifier("connection", "k8s.pod.ip", "4.4.4.4"))
-	assert.Contains(t, c.Pods, newPodIdentifier("resource_attribute", "k8s.pod.ip", "4.4.4.4"))
+	// Verify pod is queryable by all expected identifiers
+	assertPodExists(t, c, newPodIdentifier("resource_attribute", "k8s.pod.uid", "uid-leak-test"), "4.4.4.4", "podLeak", "uid-leak-test")
+	assertPodExists(t, c, newPodIdentifier("connection", "k8s.pod.ip", "4.4.4.4"), "4.4.4.4", "podLeak", "uid-leak-test")
+	assertPodExists(t, c, newPodIdentifier("resource_attribute", "k8s.pod.ip", "4.4.4.4"), "4.4.4.4", "podLeak", "uid-leak-test")
 
 	// Clear the delete queue
 	c.deleteQueue = c.deleteQueue[:0]
@@ -4862,5 +4840,6 @@ func TestPodDeleteIPMissingFromDeleteEvent(t *testing.T) {
 	c.deleteLoopProcessing(0)
 
 	// In the fixed state, all keys associated with the pod should be successfully cleaned up from the cache.
-	assert.Empty(t, c.Pods)
+	assert.Empty(t, c.informer.GetStore().List())
+	assert.Empty(t, c.deletedPods)
 }

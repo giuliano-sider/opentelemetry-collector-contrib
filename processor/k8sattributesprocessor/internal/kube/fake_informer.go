@@ -8,16 +8,20 @@ import (
 	"sync"
 	"time"
 
+	api_v1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	clientmeta "k8s.io/client-go/metadata"
 	"k8s.io/client-go/tools/cache"
+	"fmt"
 )
 
 type FakeInformer struct {
 	*FakeController
 
+	store         cache.Indexer
 	namespace     string
 	labelSelector labels.Selector
 	fieldSelector fields.Selector
@@ -28,9 +32,24 @@ func NewFakeInformer(
 	namespace string,
 	labelSelector labels.Selector,
 	fieldSelector fields.Selector,
-) cache.SharedInformer {
+) cache.SharedIndexInformer {
+	keyFunc := func(obj any) (string, error) {
+		switch p := obj.(type) {
+		case *Pod:
+			return p.Namespace + "/" + p.Name, nil
+		case Pod:
+			return p.Namespace + "/" + p.Name, nil
+		case *api_v1.Pod:
+			return p.Namespace + "/" + p.Name, nil
+		case api_v1.Pod:
+			return p.Namespace + "/" + p.Name, nil
+		default:
+			return "", fmt.Errorf("unknown type")
+		}
+	}
 	return &FakeInformer{
 		FakeController: &FakeController{},
+		store:          cache.NewIndexer(keyFunc, cache.Indexers{}),
 		namespace:      namespace,
 		labelSelector:  labelSelector,
 		fieldSelector:  fieldSelector,
@@ -61,67 +80,69 @@ func (*FakeInformer) SetTransform(cache.TransformFunc) error {
 	return nil
 }
 
-func (*FakeInformer) GetStore() cache.Store {
-	return cache.NewStore(func(_ any) (string, error) { return "", nil })
+func (f *FakeInformer) GetStore() cache.Store {
+	return f.store
+}
+
+func (f *FakeInformer) GetIndexer() cache.Indexer {
+	return f.store
+}
+
+func (f *FakeInformer) AddIndexers(indexers cache.Indexers) error {
+	return f.store.AddIndexers(indexers)
 }
 
 func (f *FakeInformer) GetController() cache.Controller {
 	return f.FakeController
 }
 
-type FakeNamespaceInformer struct {
-	*FakeController
-}
-
 func NewFakeNamespaceInformer(
 	_ clientmeta.Interface,
 ) cache.SharedInformer {
+	keyFunc := func(obj any) (string, error) {
+		switch ns := obj.(type) {
+		case *Namespace:
+			return ns.Name, nil
+		case Namespace:
+			return ns.Name, nil
+		case *api_v1.Namespace:
+			return ns.Name, nil
+		case api_v1.Namespace:
+			return ns.Name, nil
+		default:
+			return "", fmt.Errorf("unknown type")
+		}
+	}
 	return &FakeInformer{
 		FakeController: &FakeController{},
+		store:          cache.NewIndexer(keyFunc, cache.Indexers{}),
 	}
-}
-
-func (*FakeNamespaceInformer) AddEventHandler(cache.ResourceEventHandler) {}
-
-func (*FakeNamespaceInformer) AddEventHandlerWithResyncPeriod(cache.ResourceEventHandler, time.Duration) {
-}
-
-func (*FakeNamespaceInformer) GetStore() cache.Store {
-	return cache.NewStore(func(any) (string, error) { return "", nil })
-}
-
-func (f *FakeNamespaceInformer) GetController() cache.Controller {
-	return f.FakeController
-}
-
-type FakeReplicaSetInformer struct {
-	*FakeController
 }
 
 func NewFakeReplicaSetInformer(
 	_ clientmeta.Interface,
 	_ string,
 ) cache.SharedInformer {
+	keyFunc := func(obj any) (string, error) {
+		switch rs := obj.(type) {
+		case *ReplicaSet:
+			return rs.Namespace + "/" + rs.Name, nil
+		case ReplicaSet:
+			return rs.Namespace + "/" + rs.Name, nil
+		case *api_v1.Pod:
+			return rs.Namespace + "/" + rs.Name, nil
+		case *meta_v1.PartialObjectMetadata:
+			return rs.Namespace + "/" + rs.Name, nil
+		case meta_v1.PartialObjectMetadata:
+			return rs.Namespace + "/" + rs.Name, nil
+		default:
+			return "", fmt.Errorf("unknown type")
+		}
+	}
 	return &FakeInformer{
 		FakeController: &FakeController{},
+		store:          cache.NewIndexer(keyFunc, cache.Indexers{}),
 	}
-}
-
-func (*FakeReplicaSetInformer) AddEventHandler(cache.ResourceEventHandler) {}
-
-func (*FakeReplicaSetInformer) AddEventHandlerWithResyncPeriod(cache.ResourceEventHandler, time.Duration) {
-}
-
-func (*FakeReplicaSetInformer) SetTransform(cache.TransformFunc) error {
-	return nil
-}
-
-func (*FakeReplicaSetInformer) GetStore() cache.Store {
-	return cache.NewStore(func(any) (string, error) { return "", nil })
-}
-
-func (f *FakeReplicaSetInformer) GetController() cache.Controller {
-	return f.FakeController
 }
 
 type FakeController struct {

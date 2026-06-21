@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/distribution/reference"
@@ -40,7 +41,7 @@ type WatchClient struct {
 	logger                 *zap.Logger
 	kc                     kubernetes.Interface
 	mc                     clientmeta.Interface
-	informer               cache.SharedInformer
+	informer               cache.SharedIndexInformer
 	namespaceInformer      cache.SharedInformer
 	nodeInformer           cache.SharedInformer
 	deploymentInformer     cache.SharedInformer
@@ -56,9 +57,9 @@ type WatchClient struct {
 	watchSyncPeriod        time.Duration
 	podDeleteGracePeriod   time.Duration
 
-	// A map containing Pod related data, used to associate them with resources.
-	// Key can be either an IP address or Pod UID
-	Pods         map[PodIdentifier]*Pod
+	// A map containing recently deleted Pods, used to support delete grace period.
+	deletedPods  map[PodIdentifier]*Pod
+	podCount     int64
 	Rules        ExtractionRules
 	Filters      Filters
 	Associations []Association
@@ -158,7 +159,7 @@ func New(
 		podDeleteGracePeriod:   podDeleteGracePeriod,
 	}
 
-	c.Pods = map[PodIdentifier]*Pod{}
+	c.deletedPods = map[PodIdentifier]*Pod{}
 	c.Namespaces = map[string]*Namespace{}
 	c.Nodes = map[string]*Node{}
 	c.ReplicaSets = map[string]*ReplicaSet{}
@@ -187,7 +188,7 @@ func New(
 		zap.String("fieldSelector", fieldSelector.String()),
 	)
 	if informersFactory.newInformer == nil {
-		informersFactory.newInformer = func(client kubernetes.Interface, ns string, ls labels.Selector, fs fields.Selector) cache.SharedInformer {
+		informersFactory.newInformer = func(client kubernetes.Interface, ns string, ls labels.Selector, fs fields.Selector) cache.SharedIndexInformer {
 			return newSharedInformer(client, ns, ls, fs, watchSyncPeriod)
 		}
 	}
@@ -212,6 +213,25 @@ func New(
 	}
 
 	c.informer = informersFactory.newInformer(c.kc, c.Filters.Namespace, labelSelector, fieldSelector)
+
+	err = c.informer.AddIndexers(cache.Indexers{
+		"pod_identifiers": func(obj any) ([]string, error) {
+			pod, ok := obj.(*Pod)
+			if !ok {
+				return nil, nil
+			}
+			identifiers := c.getIdentifiersFromAssoc(pod)
+			keys := make([]string, len(identifiers))
+			for i, id := range identifiers {
+				keys[i] = id.String()
+			}
+			return keys, nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	err = c.informer.SetTransform(
 		func(object any) (any, error) {
 			originalPod, success := object.(*api_v1.Pod)
@@ -219,7 +239,8 @@ func New(
 				return object, nil
 			}
 
-			return removeUnnecessaryPodData(originalPod, c.Rules), nil
+			prunedPod := removeUnnecessaryPodData(originalPod, c.Rules)
+			return c.podFromAPI(prunedPod), nil
 		},
 	)
 	if err != nil {
@@ -409,17 +430,31 @@ func (c *WatchClient) handlePodAdd(obj any) {
 	if metadata.ProcessorK8sattributesTelemetryEnableNewFormatMetricsFeatureGate.IsEnabled() {
 		c.telemetryBuilder.K8sWatcherPodAdded.Add(context.Background(), 1)
 	}
-	if pod, ok := obj.(*api_v1.Pod); ok {
-		c.addOrUpdatePod(pod)
-	} else {
-		c.logger.Error("object received was not of type api_v1.Pod", zap.Any("received", obj))
+
+	var pod *Pod
+	switch p := obj.(type) {
+	case *Pod:
+		pod = p
+	case *api_v1.Pod:
+		pod = c.podFromAPI(removeUnnecessaryPodData(p, c.Rules))
+		if len(c.getIdentifiersFromAssoc(pod)) == 0 {
+			return
+		}
+		if c.informer != nil {
+			_ = c.informer.GetStore().Add(pod)
+		}
+	default:
+		c.logger.Error("object received was not of type *Pod or *api_v1.Pod", zap.Any("received", obj))
+		return
 	}
-	podTableSize := len(c.Pods)
+
+	atomic.AddInt64(&c.podCount, 1)
+	podTableSize := atomic.LoadInt64(&c.podCount)
 	if !metadata.ProcessorK8sattributesTelemetryDisableOldFormatMetricsFeatureGate.IsEnabled() {
-		c.telemetryBuilder.OtelsvcK8sPodTableSize.Record(context.Background(), int64(podTableSize))
+		c.telemetryBuilder.OtelsvcK8sPodTableSize.Record(context.Background(), podTableSize)
 	}
 	if metadata.ProcessorK8sattributesTelemetryEnableNewFormatMetricsFeatureGate.IsEnabled() {
-		c.telemetryBuilder.K8sWatcherPodCacheSize.Record(context.Background(), int64(podTableSize))
+		c.telemetryBuilder.K8sWatcherPodCacheSize.Record(context.Background(), podTableSize)
 	}
 }
 
@@ -430,18 +465,30 @@ func (c *WatchClient) handlePodUpdate(_, newPod any) {
 	if metadata.ProcessorK8sattributesTelemetryEnableNewFormatMetricsFeatureGate.IsEnabled() {
 		c.telemetryBuilder.K8sWatcherPodUpdated.Add(context.Background(), 1)
 	}
-	if pod, ok := newPod.(*api_v1.Pod); ok {
-		// TODO: update or remove based on whether container is ready/unready?.
-		c.addOrUpdatePod(pod)
-	} else {
-		c.logger.Error("object received was not of type api_v1.Pod", zap.Any("received", newPod))
+
+	var pod *Pod
+	switch p := newPod.(type) {
+	case *Pod:
+		pod = p
+	case *api_v1.Pod:
+		pod = c.podFromAPI(removeUnnecessaryPodData(p, c.Rules))
+		if len(c.getIdentifiersFromAssoc(pod)) == 0 {
+			return
+		}
+		if c.informer != nil {
+			_ = c.informer.GetStore().Update(pod)
+		}
+	default:
+		c.logger.Error("object received was not of type *Pod or *api_v1.Pod", zap.Any("received", newPod))
+		return
 	}
-	podTableSize := len(c.Pods)
+
+	podTableSize := atomic.LoadInt64(&c.podCount)
 	if !metadata.ProcessorK8sattributesTelemetryDisableOldFormatMetricsFeatureGate.IsEnabled() {
-		c.telemetryBuilder.OtelsvcK8sPodTableSize.Record(context.Background(), int64(podTableSize))
+		c.telemetryBuilder.OtelsvcK8sPodTableSize.Record(context.Background(), podTableSize)
 	}
 	if metadata.ProcessorK8sattributesTelemetryEnableNewFormatMetricsFeatureGate.IsEnabled() {
-		c.telemetryBuilder.K8sWatcherPodCacheSize.Record(context.Background(), int64(podTableSize))
+		c.telemetryBuilder.K8sWatcherPodCacheSize.Record(context.Background(), podTableSize)
 	}
 }
 
@@ -452,17 +499,32 @@ func (c *WatchClient) handlePodDelete(obj any) {
 	if metadata.ProcessorK8sattributesTelemetryEnableNewFormatMetricsFeatureGate.IsEnabled() {
 		c.telemetryBuilder.K8sWatcherPodDeleted.Add(context.Background(), 1)
 	}
-	if pod, ok := ignoreDeletedFinalStateUnknown(obj).(*api_v1.Pod); ok {
+
+	var pod *Pod
+	unwrapped := ignoreDeletedFinalStateUnknown(obj)
+	switch p := unwrapped.(type) {
+	case *Pod:
+		pod = p
 		c.forgetPod(pod)
-	} else {
-		c.logger.Error("object received was not of type api_v1.Pod", zap.Any("received", obj))
+	case *api_v1.Pod:
+		pod = c.podFromAPI(removeUnnecessaryPodData(p, c.Rules))
+		c.forgetPod(pod)
+		if c.informer != nil {
+			_ = c.informer.GetStore().Delete(pod)
+		}
+	default:
+		c.logger.Error("object received was not of type *Pod or *api_v1.Pod", zap.Any("received", obj))
+		return
 	}
-	podTableSize := len(c.Pods)
+
+	atomic.AddInt64(&c.podCount, -1)
+
+	podTableSize := atomic.LoadInt64(&c.podCount)
 	if !metadata.ProcessorK8sattributesTelemetryDisableOldFormatMetricsFeatureGate.IsEnabled() {
-		c.telemetryBuilder.OtelsvcK8sPodTableSize.Record(context.Background(), int64(podTableSize))
+		c.telemetryBuilder.OtelsvcK8sPodTableSize.Record(context.Background(), podTableSize)
 	}
 	if metadata.ProcessorK8sattributesTelemetryEnableNewFormatMetricsFeatureGate.IsEnabled() {
-		c.telemetryBuilder.K8sWatcherPodCacheSize.Record(context.Background(), int64(podTableSize))
+		c.telemetryBuilder.K8sWatcherPodCacheSize.Record(context.Background(), podTableSize)
 	}
 }
 
@@ -775,43 +837,51 @@ func (c *WatchClient) deleteLoopProcessing(gracePeriod time.Duration) {
 	c.deleteMut.Unlock()
 
 	c.m.Lock()
-	deleted := false
 	for i := range toDelete {
 		d := toDelete[i]
-		if p, ok := c.Pods[d.id]; ok {
+		if p, ok := c.deletedPods[d.id]; ok {
 			// Sanity check: make sure we are deleting the same pod
 			// and the underlying state (ip<>pod mapping) has not changed.
 			if p.PodUID == d.podUID {
-				delete(c.Pods, d.id)
-				deleted = true
+				delete(c.deletedPods, d.id)
 			}
 		}
-	}
-
-	if deleted {
-		c.compactPodMap()
-	}
-
-	podTableSize := len(c.Pods)
-	if !metadata.ProcessorK8sattributesTelemetryDisableOldFormatMetricsFeatureGate.IsEnabled() {
-		c.telemetryBuilder.OtelsvcK8sPodTableSize.Record(context.Background(), int64(podTableSize))
-	}
-	if metadata.ProcessorK8sattributesTelemetryEnableNewFormatMetricsFeatureGate.IsEnabled() {
-		c.telemetryBuilder.K8sWatcherPodCacheSize.Record(context.Background(), int64(podTableSize))
 	}
 	c.m.Unlock()
 }
 
-func (c *WatchClient) compactPodMap() {
-	newMap := make(map[PodIdentifier]*Pod, len(c.Pods))
-	maps.Copy(newMap, c.Pods)
-	c.Pods = newMap
+func comparePodsNewer(a, b *Pod) bool {
+	if a.StartTime != nil && b.StartTime != nil {
+		if !a.StartTime.Equal(b.StartTime) {
+			return a.StartTime.After(b.StartTime.Time)
+		}
+	}
+	// Fallback to name comparison to keep it deterministic in tests
+	return a.Name > b.Name
 }
 
 // GetPod takes an IP address or Pod UID and returns the pod the identifier is associated with.
 func (c *WatchClient) GetPod(identifier PodIdentifier) (*Pod, bool) {
+	key := identifier.String()
+	if c.informer != nil {
+		objs, err := c.informer.GetIndexer().ByIndex("pod_identifiers", key)
+		if err == nil && len(objs) > 0 {
+			var newestPod *Pod
+			for _, obj := range objs {
+				pod := obj.(*Pod)
+				if newestPod == nil || comparePodsNewer(pod, newestPod) {
+					newestPod = pod
+				}
+			}
+			if newestPod.Ignore {
+				return nil, false
+			}
+			return newestPod, true
+		}
+	}
+
 	c.m.RLock()
-	pod, ok := c.Pods[identifier]
+	pod, ok := c.deletedPods[identifier]
 	c.m.RUnlock()
 	if ok {
 		if pod.Ignore {
@@ -1610,58 +1680,51 @@ func (c *WatchClient) getIdentifiersFromAssoc(pod *Pod) []PodIdentifier {
 	return ids
 }
 
-func (c *WatchClient) addOrUpdatePod(pod *api_v1.Pod) {
-	newPod := c.podFromAPI(pod)
+func (c *WatchClient) forgetPod(pod *Pod) {
+	var cachedPod *Pod
+	if c.informer != nil && pod.PodUID != "" {
+		uidId := PodIdentifier{
+			PodIdentifierAttributeFromResourceAttribute(string(conventions.K8SPodUIDKey), pod.PodUID),
+		}
+		objs, err := c.informer.GetIndexer().ByIndex("pod_identifiers", uidId.String())
+		if err == nil && len(objs) > 0 {
+			cachedPod = objs[0].(*Pod)
+		}
+	}
+
+	podToRemove := pod
+	if cachedPod != nil {
+		podToRemove = cachedPod
+	}
+
+	identifiers := c.getIdentifiersFromAssoc(podToRemove)
 
 	c.m.Lock()
-	defer c.m.Unlock()
-
-	identifiers := c.getIdentifiersFromAssoc(newPod)
 	for i := range identifiers {
 		id := identifiers[i]
-		// compare initial scheduled timestamp for existing pod and new pod with same identifier
-		// and only replace old pod if scheduled time of new pod is newer or equal.
-		// This should fix the case where scheduler has assigned the same attributes (like IP address)
-		// to a new pod but update event for the old pod came in later.
-		if p, ok := c.Pods[id]; ok {
-			if pod.Status.StartTime.Before(p.StartTime) {
-				continue
+		var existsInCache bool
+		if c.informer != nil {
+			objs, err := c.informer.GetIndexer().ByIndex("pod_identifiers", id.String())
+			if err == nil && len(objs) > 0 {
+				activePod := objs[0].(*Pod)
+				if activePod.PodUID == podToRemove.PodUID {
+					existsInCache = true
+				}
 			}
 		}
-		c.Pods[id] = newPod
-	}
-}
-
-func (c *WatchClient) forgetPod(pod *api_v1.Pod) {
-	// Look up the cached pod using its UID. Unlike dynamic status attributes (such as IP addresses)
-	// which may be cleared or missing in the final DELETE event payload, the Pod UID is immutable
-	// and guaranteed to be present. Using the cached pod ensures we generate and clean up all keys
-	// under which the pod was originally registered.
-	uidKey := PodIdentifier{
-		PodIdentifierAttributeFromResourceAttribute(string(conventions.K8SPodUIDKey), string(pod.UID)),
-	}
-	c.m.RLock()
-	cachedPod, ok := c.Pods[uidKey]
-	c.m.RUnlock()
-
-	var identifiers []PodIdentifier
-	if ok {
-		identifiers = c.getIdentifiersFromAssoc(cachedPod)
-	} else {
-		// Fallback: if the pod was never added to the cache (e.g. startup/informer sync edge cases),
-		// generate deletion keys from the incoming delete event payload directly.
-		podToRemove := c.podFromAPI(pod)
-		identifiers = c.getIdentifiersFromAssoc(podToRemove)
-	}
-
-	for i := range identifiers {
-		id := identifiers[i]
-		p, ok := c.GetPod(id)
-
-		if ok && p.PodUID == string(pod.UID) {
-			c.appendDeleteQueue(id, p.PodUID)
+		if !existsInCache {
+			if _, ok := c.deletedPods[id]; ok {
+				existsInCache = true
+			}
 		}
+		if !existsInCache {
+			continue
+		}
+
+		c.deletedPods[id] = podToRemove
+		c.appendDeleteQueue(id, podToRemove.PodUID)
 	}
+	c.m.Unlock()
 }
 
 func (c *WatchClient) appendDeleteQueue(podID PodIdentifier, podUID string) {

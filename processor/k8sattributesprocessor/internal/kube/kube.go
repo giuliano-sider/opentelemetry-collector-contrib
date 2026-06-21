@@ -5,6 +5,7 @@ package kube // import "github.com/open-telemetry/opentelemetry-collector-contri
 
 import (
 	"regexp"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
@@ -49,6 +50,25 @@ type PodIdentifier [PodIdentifierMaxLength]PodIdentifierAttribute
 // IsNotEmpty checks if PodIdentifier is empty or not
 func (p *PodIdentifier) IsNotEmpty() bool {
 	return p[0].Source.From != ""
+}
+
+// String serializes PodIdentifier to a unique string key
+func (p PodIdentifier) String() string {
+	var sb strings.Builder
+	for i, attr := range p {
+		if attr.Source.From == "" {
+			break
+		}
+		if i > 0 {
+			sb.WriteByte('+')
+		}
+		sb.WriteString(attr.Source.From)
+		sb.WriteByte(':')
+		sb.WriteString(attr.Source.Name)
+		sb.WriteByte(':')
+		sb.WriteString(attr.Value)
+	}
+	return sb.String()
 }
 
 // PodIdentifierAttributeFromSource builds PodIdentifierAttribute using AssociationSource and value
